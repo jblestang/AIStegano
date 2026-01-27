@@ -5,6 +5,31 @@ use crate::error::{Error, Result};
 use crate::vfs::types::{Inode, InodeId, ROOT_INODE_ID};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Allocation info for a single host file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostAllocation {
+    /// Original logical size of the file (before hidden data).
+    pub logical_size: u64,
+    /// Total slack space used in this host.
+    pub slack_used: u64,
+}
+
+/// A symbol stored in slack space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolAllocation {
+    /// RaptorQ symbol ID.
+    pub symbol_id: u32,
+    /// Path to the host file.
+    pub host_path: PathBuf,
+    /// Offset within slack space.
+    pub offset: u64,
+    /// Length of symbol data.
+    pub length: u32,
+    /// ID of the VFS file this symbol belongs to.
+    pub file_id: InodeId,
+}
 
 /// The superblock contains all VFS metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +51,18 @@ pub struct Superblock {
     /// All inodes indexed by ID.
     pub inodes: HashMap<InodeId, Inode>,
     /// Salt for password verification.
+    /// Salt for password verification.
     pub salt: [u8; 32],
+    /// Next available symbol ID.
+    pub next_symbol_id: u32,
+    /// Host file allocations (logical sizes and slack usage).
+    pub hosts: HashMap<PathBuf, HostAllocation>,
+    /// All symbol allocations.
+    pub symbols: Vec<SymbolAllocation>,
+    /// Sequence number for versioning (monotonically increasing).
+    pub sequence_number: u64,
+    /// Unique ID for this VFS instance.
+    pub uuid: u128,
 }
 
 impl Superblock {
@@ -45,6 +81,11 @@ impl Superblock {
             next_inode_id: 1,
             inodes,
             salt,
+            next_symbol_id: 0,
+            hosts: HashMap::new(),
+            symbols: Vec::new(),
+            sequence_number: 0,
+            uuid: rand::random(),
         }
     }
 
@@ -135,6 +176,81 @@ impl Superblock {
     /// Get total size of all files.
     pub fn total_size(&self) -> u64 {
         self.inodes.values().map(|i| i.size).sum()
+    }
+
+    // ===== Symbol Management =====
+
+    /// Allocate a new symbol ID.
+    pub fn alloc_symbol_id(&mut self) -> u32 {
+        let id = self.next_symbol_id;
+        self.next_symbol_id += 1;
+        id
+    }
+
+    /// Add a symbol allocation.
+    pub fn add_symbol(&mut self, alloc: SymbolAllocation) {
+        // Update host allocation
+        let host = self
+            .hosts
+            .entry(alloc.host_path.clone())
+            .or_insert(HostAllocation {
+                logical_size: 0,
+                slack_used: 0,
+            });
+        host.slack_used += alloc.length as u64;
+
+        // Track next symbol ID
+        self.next_symbol_id = self.next_symbol_id.max(alloc.symbol_id + 1);
+
+        // Add to symbols list
+        self.symbols.push(alloc);
+    }
+
+    /// Get all symbols for a specific file.
+    pub fn get_symbols_for_file(&self, file_id: InodeId) -> Vec<&SymbolAllocation> {
+        self.symbols
+            .iter()
+            .filter(|s| s.file_id == file_id)
+            .collect()
+    }
+
+    /// Remove all symbols for a specific file.
+    pub fn remove_symbols_for_file(&mut self, file_id: InodeId) {
+        // Update host slack usage
+        for symbol in self.symbols.iter().filter(|s| s.file_id == file_id) {
+            if let Some(host) = self.hosts.get_mut(&symbol.host_path) {
+                host.slack_used = host.slack_used.saturating_sub(symbol.length as u64);
+            }
+        }
+
+        // Remove symbols
+        self.symbols.retain(|s| s.file_id != file_id);
+
+        // Clean up hosts with no symbols
+        self.hosts
+            .retain(|_, h| h.slack_used > 0 || h.logical_size > 0);
+    }
+
+    /// Get logical size for a host file.
+    pub fn get_logical_size(&self, path: &std::path::Path) -> Option<u64> {
+        self.hosts.get(path).map(|h| h.logical_size)
+    }
+
+    /// Set logical size for a host file.
+    pub fn set_logical_size(&mut self, path: &std::path::Path, size: u64) {
+        let host = self
+            .hosts
+            .entry(path.to_path_buf())
+            .or_insert(HostAllocation {
+                logical_size: 0,
+                slack_used: 0,
+            });
+        host.logical_size = size;
+    }
+
+    /// Get used slack for a host file.
+    pub fn get_used_slack(&self, path: &std::path::Path) -> u64 {
+        self.hosts.get(path).map(|h| h.slack_used).unwrap_or(0)
     }
 }
 

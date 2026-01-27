@@ -7,10 +7,10 @@ use crate::crypto::{
 use crate::encoding::{decode, encode, EncodedData, EncodingSymbol};
 use crate::error::{Error, Result};
 use crate::storage::{
-    read_slack, wipe_slack, write_slack, HostManager, SlackMetadata, SymbolLocation,
+    read_slack, wipe_slack, write_slack, HostManager, SlackMetadata, SuperblockLocation,
 };
 use crate::vfs::path::VfsPath;
-use crate::vfs::superblock::Superblock;
+use crate::vfs::superblock::{Superblock, SymbolAllocation};
 use crate::vfs::types::{DirEntry, EncodingInfo, Inode, InodeId, ROOT_INODE_ID};
 use std::path::{Path, PathBuf};
 
@@ -108,21 +108,20 @@ impl SlackVfs {
     pub fn mount(host_dir: &Path, password: &str) -> Result<Self> {
         // Load metadata
         let metadata = SlackMetadata::load(host_dir)?;
-        if metadata.hosts.is_empty() {
+        if !metadata.is_initialized() {
             return Err(Error::NotInitialized(host_dir.to_path_buf()));
         }
 
         // Scan host files
         let mut host_manager = HostManager::scan(host_dir, metadata.block_size)?;
 
-        // Apply used slack from metadata
-        for (path, host_meta) in &metadata.hosts {
-            let used: u64 = host_meta.symbols.iter().map(|s| s.length as u64).sum();
-            host_manager.apply_used_slack(path, used);
-        }
-
         // Read and decrypt superblock
-        let superblock = Self::read_superblock(&metadata, &host_manager, password)?;
+        let superblock = Self::read_superblock(&metadata, password)?;
+
+        // Apply used slack from superblock
+        for (path, host_alloc) in &superblock.hosts {
+            host_manager.apply_used_slack(path, host_alloc.slack_used);
+        }
 
         // Derive key
         let kdf = KeyDerivation::from_salt(superblock.salt);
@@ -139,11 +138,7 @@ impl SlackVfs {
     }
 
     /// Read and decrypt the superblock from slack space.
-    fn read_superblock(
-        metadata: &SlackMetadata,
-        _host_manager: &HostManager,
-        password: &str,
-    ) -> Result<Superblock> {
+    fn read_superblock(metadata: &SlackMetadata, password: &str) -> Result<Superblock> {
         // Get salt from metadata
         let salt = metadata
             .salt
@@ -153,70 +148,89 @@ impl SlackVfs {
         let kdf = KeyDerivation::from_salt(salt);
         let key = kdf.derive_key(password)?;
 
-        // Collect superblock symbols
-        let symbol_data = Self::collect_file_symbols_from_meta(metadata, SUPERBLOCK_FILE_ID)?;
+        let mut best_superblock: Option<Superblock> = None;
+        let mut failures = Vec::new();
 
-        if symbol_data.is_empty() {
-            return Err(Error::NotInitialized(metadata.file_path_from_hosts()));
-        }
-
-        // Get all symbol data concatenated
-        let mut all_data = Vec::new();
-        for symbol in &symbol_data {
-            all_data.extend_from_slice(&symbol.data);
-        }
-
-        // The data is: [4 bytes: encrypted length] [encrypted data]
-        if all_data.len() < 4 {
+        if metadata.superblocks.is_empty() {
             return Err(Error::DataCorruption(
-                "Superblock data too short".to_string(),
+                "No superblock locations in metadata".to_string(),
             ));
         }
 
-        let encrypted_len =
-            u32::from_le_bytes([all_data[0], all_data[1], all_data[2], all_data[3]]) as usize;
+        // Try all locations and pick the best one (highest sequence number)
+        for sb_loc in &metadata.superblocks {
+            // Read superblock data from slack space
+            match read_slack(&sb_loc.host_path, sb_loc.offset, sb_loc.length as usize) {
+                Ok(sb_data) => {
+                    // Check length integrity
+                    if sb_data.len() < 4 {
+                        failures.push("Data too short".to_string());
+                        continue;
+                    }
 
-        if all_data.len() < 4 + encrypted_len {
-            return Err(Error::DataCorruption(
-                "Superblock data truncated".to_string(),
-            ));
+                    let encrypted_len =
+                        u32::from_le_bytes([sb_data[0], sb_data[1], sb_data[2], sb_data[3]])
+                            as usize;
+                    if sb_data.len() < 4 + encrypted_len {
+                        failures.push("Data truncated".to_string());
+                        continue;
+                    }
+
+                    let encrypted_bytes = &sb_data[4..4 + encrypted_len];
+
+                    // Decrypt using pre-derived key
+                    match decrypt_with_key(encrypted_bytes, &key) {
+                        Ok(plaintext) => {
+                            if let Ok(sb) = Superblock::from_bytes(&plaintext) {
+                                // Found valid superblock
+                                match best_superblock {
+                                    Some(ref current) => {
+                                        if sb.sequence_number > current.sequence_number {
+                                            best_superblock = Some(sb);
+                                        }
+                                    }
+                                    None => best_superblock = Some(sb),
+                                }
+                            } else {
+                                failures.push("Deserialization invalid".to_string());
+                            }
+                        }
+                        Err(_) => failures.push("Decryption failed".to_string()),
+                    }
+                }
+                Err(e) => failures.push(e.to_string()),
+            }
         }
 
-        let encrypted_bytes = &all_data[4..4 + encrypted_len];
-
-        // Decrypt using pre-derived key
-        let plaintext = decrypt_with_key(encrypted_bytes, &key)?;
-
-        // Deserialize superblock
-        Superblock::from_bytes(&plaintext)
+        best_superblock.ok_or_else(|| {
+            Error::DataCorruption(format!(
+                "Failed to read any valid superblock. Failures: {:?}",
+                failures
+            ))
+        })
     }
 
-    /// Collect all symbols for a file from slack space.
-    fn collect_file_symbols(
-        metadata: &SlackMetadata,
-        _host_manager: &HostManager,
-        file_id: u64,
-    ) -> Result<Vec<EncodingSymbol>> {
-        Self::collect_file_symbols_from_meta(metadata, file_id)
-    }
-
-    /// Collect all symbols for a file from slack space (metadata only).
-    fn collect_file_symbols_from_meta(
-        metadata: &SlackMetadata,
-        file_id: u64,
-    ) -> Result<Vec<EncodingSymbol>> {
-        let stored_symbols = metadata.get_symbols_for_file(file_id);
+    /// Collect all symbols for a file from slack space using superblock.
+    fn collect_file_symbols(&self, file_id: InodeId) -> Result<Vec<EncodingSymbol>> {
+        let stored_symbols = self.superblock.get_symbols_for_file(file_id);
         let mut symbols = Vec::new();
 
-        for (path, stored) in stored_symbols {
+        for alloc in stored_symbols {
             // Get logical size for this host
-            let logical_size = metadata.get_logical_size(&path).unwrap_or(0);
+            let logical_size = self
+                .superblock
+                .get_logical_size(&alloc.host_path)
+                .unwrap_or(0);
 
             // Read symbol data from slack
-            let data = read_slack(&path, logical_size + stored.offset, stored.length as usize)?;
+            let data = read_slack(
+                &alloc.host_path,
+                logical_size + alloc.offset,
+                alloc.length as usize,
+            )?;
 
             symbols.push(EncodingSymbol {
-                id: stored.symbol_id,
+                id: alloc.symbol_id,
                 data,
             });
         }
@@ -226,59 +240,125 @@ impl SlackVfs {
 
     /// Write the superblock to slack space.
     fn write_superblock(&mut self) -> Result<()> {
-        // Remove old superblock symbols
-        self.metadata.remove_symbols_for_file(SUPERBLOCK_FILE_ID);
+        // Increment sequence number
+        self.superblock.sequence_number += 1;
 
-        // Serialize superblock
+        // Remove old superblock symbols from tracking
+        self.superblock
+            .remove_symbols_for_file(SUPERBLOCK_FILE_ID as InodeId);
+
+        // Sync host manager with updated superblock state (to reuse freed space)
+        for (path, host_alloc) in &self.superblock.hosts {
+            self.host_manager
+                .apply_used_slack(path, host_alloc.slack_used);
+        }
+
+        // 1. Initial Serialize to get baseline size
         let sb_bytes = self.superblock.to_bytes()?;
+        let encrypted_baseline = encrypt_with_key(&sb_bytes, &self.key)?;
+        let mut total_len = encrypted_baseline.len() as u64 + 4; // +4 for length prefix
 
-        // Encrypt using the pre-derived key directly
-        let encrypted = encrypt_with_key(&sb_bytes, &self.key)?;
+        // Add safety margin for host map changes (path string + struct overhead approx 100 bytes per host)
+        // With 3 replicas and temp paths, this can grow. 512 bytes is safe (3 hosts * 100 + headroom).
+        total_len += 512;
 
-        // Prepend length
-        let len = encrypted.len() as u32;
-        let mut data = len.to_le_bytes().to_vec();
-        data.extend_from_slice(&encrypted);
+        // 2. Identify candidate hosts (target 3 replicas)
+        let target_replicas = 3.min(self.host_manager.host_count());
+        let mut candidates = Vec::new();
 
-        // Store in slack space (simple: just write to first available host)
-        self.store_raw_data(&data, SUPERBLOCK_FILE_ID)?;
-
-        Ok(())
-    }
-
-    /// Store raw data in slack space without encoding (for superblock).
-    fn store_raw_data(&mut self, data: &[u8], file_id: u64) -> Result<()> {
-        // Find a host with enough space
         for host in self.host_manager.hosts_mut() {
-            if host.can_fit(data.len() as u64) {
-                let offset = host.allocate(data.len() as u64).unwrap();
-
-                // Write to slack
-                write_slack(&host.path, data, host.logical_size + offset)?;
-
-                // Record in metadata
-                self.metadata.add_symbol(
-                    SymbolLocation {
-                        host_path: host.path.clone(),
-                        offset,
-                        symbol_id: 0,
-                        length: data.len() as u32,
-                    },
-                    file_id,
-                );
-
-                // Set logical size
-                self.metadata
-                    .set_logical_size(&host.path, host.logical_size);
-
-                return Ok(());
+            if candidates.len() >= target_replicas {
+                break;
+            }
+            if host.can_fit(total_len) {
+                candidates.push(host.path.clone());
             }
         }
 
-        Err(Error::InsufficientSpace {
-            needed: data.len() as u64,
-            available: self.host_manager.total_available(),
-        })
+        if candidates.is_empty() {
+            return Err(Error::InsufficientSpace {
+                needed: total_len,
+                available: self.host_manager.total_available(),
+            });
+        }
+
+        // 3. Pre-register candidates in superblock to stabilize size
+        // We add them with 0 usage first, just to ensure the keys exist in the map
+        for path in &candidates {
+            self.superblock.hosts.entry(path.clone()).or_insert(
+                crate::vfs::superblock::HostAllocation {
+                    logical_size: 0,
+                    slack_used: 0,
+                },
+            );
+        }
+
+        // 4. Update superblock with actual allocations
+        // We allocate space now.
+        let mut allocations = Vec::new(); // (path, offset)
+
+        for path in &candidates {
+            // We need to get mut reference to host from manager.
+            // We can use get_host_mut since we added it.
+            if let Some(host) = self.host_manager.get_host_mut(path) {
+                if let Some(offset) = host.allocate(total_len) {
+                    allocations.push((path.clone(), offset));
+
+                    // Update superblock usage
+                    if let Some(alloc) = self.superblock.hosts.get_mut(path) {
+                        alloc.slack_used += total_len;
+                        alloc.logical_size = host.logical_size;
+                    }
+                }
+            }
+        }
+
+        if allocations.is_empty() {
+            return Err(Error::InsufficientSpace {
+                needed: total_len,
+                available: self.host_manager.total_available(),
+            });
+        }
+
+        // 5. Final Serialize and Encrypt
+        // Now superblock size is stable and includes all usage
+        let sb_bytes_final = self.superblock.to_bytes()?;
+        let encrypted_final = encrypt_with_key(&sb_bytes_final, &self.key)?;
+
+        let len_final = encrypted_final.len() as u32;
+        let mut data = len_final.to_le_bytes().to_vec();
+        data.extend_from_slice(&encrypted_final);
+
+        let total_written_len = data.len() as u32;
+
+        // Sanity check: Ensure it still fits in allocated space
+        if total_written_len as u64 > total_len {
+            // This implies our margin was insufficient.
+            // In production code we should loop/retry.
+            // For now, we return error to be safe instead of corrupting.
+            return Err(Error::DataCorruption(
+                "Superblock grew too large during write".to_string(),
+            ));
+        }
+
+        // 6. Write to all allocated locations
+        self.metadata.superblocks.clear();
+
+        for (path, offset) in allocations {
+            if let Some(host) = self.host_manager.get_host(&path) {
+                // Write data
+                write_slack(&path, &data, host.logical_size + offset)?;
+
+                // Update metadata
+                self.metadata.superblocks.push(SuperblockLocation {
+                    host_path: path,
+                    offset: host.logical_size + offset,
+                    length: total_written_len,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Sync all changes to disk.
@@ -404,7 +484,7 @@ impl SlackVfs {
     }
 
     /// Store a single symbol in slack space.
-    fn store_symbol(&mut self, symbol: &EncodingSymbol, file_id: u64) -> Result<()> {
+    fn store_symbol(&mut self, symbol: &EncodingSymbol, file_id: InodeId) -> Result<()> {
         // Find a host with enough space
         for host in self.host_manager.hosts_mut() {
             if host.can_fit(symbol.data.len() as u64) {
@@ -413,18 +493,16 @@ impl SlackVfs {
                 // Write to slack
                 write_slack(&host.path, &symbol.data, host.logical_size + offset)?;
 
-                // Record in metadata
-                self.metadata.add_symbol(
-                    SymbolLocation {
-                        host_path: host.path.clone(),
-                        offset,
-                        symbol_id: symbol.id,
-                        length: symbol.data.len() as u32,
-                    },
+                // Record in superblock
+                self.superblock.add_symbol(SymbolAllocation {
+                    symbol_id: symbol.id,
+                    host_path: host.path.clone(),
+                    offset,
+                    length: symbol.data.len() as u32,
                     file_id,
-                );
+                });
 
-                self.metadata
+                self.superblock
                     .set_logical_size(&host.path, host.logical_size);
 
                 return Ok(());
@@ -457,7 +535,7 @@ impl SlackVfs {
             .ok_or_else(|| Error::DataCorruption("Missing encoding info".to_string()))?;
 
         // Collect symbols
-        let symbols = Self::collect_file_symbols(&self.metadata, &self.host_manager, inode_id)?;
+        let symbols = self.collect_file_symbols(inode_id)?;
 
         // Create EncodedData for decoding
         let encoded = EncodedData {
@@ -507,8 +585,8 @@ impl SlackVfs {
             .unwrap()
             .remove_child(inode_id);
 
-        // Remove symbols from metadata (they'll be overwritten eventually)
-        self.metadata.remove_symbols_for_file(inode_id);
+        // Remove symbols from superblock (updating host allocations)
+        self.superblock.remove_symbols_for_file(inode_id);
 
         // Remove inode
         self.superblock.remove_inode(inode_id);
@@ -618,8 +696,7 @@ impl SlackVfs {
 
                 if let Some(encoding_info) = &inode.encoding_info {
                     // Count available symbols
-                    let symbols =
-                        Self::collect_file_symbols(&self.metadata, &self.host_manager, inode.id)?;
+                    let symbols = self.collect_file_symbols(inode.id)?;
 
                     let available = symbols.len();
                     let required = encoding_info.source_symbols;
@@ -673,7 +750,7 @@ impl SlackVfs {
     pub fn wipe(&mut self) -> Result<()> {
         // Wipe all host files' slack space
         for host in self.host_manager.hosts() {
-            if let Some(logical_size) = self.metadata.get_logical_size(&host.path) {
+            if let Some(logical_size) = self.superblock.get_logical_size(&host.path) {
                 wipe_slack(&host.path, logical_size, None)?;
             }
         }
@@ -743,7 +820,8 @@ mod tests {
             let path = dir.path().join(format!("host_{}.dat", i));
             let mut f = std::fs::File::create(&path).unwrap();
             // Write enough data to have slack space
-            let content = vec![0u8; 1000 + i * 500];
+            // Use small size to MAXIMIZE slack (4096 - 100 = 3996 bytes slack)
+            let content = vec![0u8; 100];
             f.write_all(&content).unwrap();
         }
 

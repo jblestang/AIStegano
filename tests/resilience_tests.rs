@@ -8,14 +8,14 @@ use tempfile::TempDir;
 
 /// Helper to create a test environment with host files.
 /// Note: file_size should NOT be a multiple of 4096 (block size) to ensure slack space exists.
-fn setup_test_env(num_files: usize, file_size: usize) -> TempDir {
+fn setup_test_env(num_files: usize, _file_size: usize) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
     for i in 0..num_files {
         let file_path = temp_dir.path().join(format!("host_{}.dat", i));
         // Use a size that is NOT aligned to block size to ensure slack space
-        // Add an offset to avoid exact block alignment
-        let actual_size = file_size + 100 + (i * 7); // Slightly different size per file
+        // Maximize slack: 100 bytes content -> ~3996 bytes slack
+        let actual_size = 100 + (i * 7);
         let data: Vec<u8> = (0..actual_size).map(|x| (x % 256) as u8).collect();
         fs::write(&file_path, &data).expect("Failed to create host file");
     }
@@ -73,8 +73,8 @@ fn test_recovery_with_minor_symbol_loss() {
     let password = "resilience_test";
 
     // Create VFS and write a file
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     let original_content = b"This is important data that must survive partial loss!";
     vfs.create_file("/important.txt", original_content)
@@ -111,8 +111,8 @@ fn test_recovery_from_one_host_file_complete_loss() {
     let host_path = temp_dir.path();
     let password = "complete_loss_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     let original_content = b"Critical data distributed across multiple hosts";
     vfs.create_file("/critical.txt", original_content)
@@ -143,8 +143,8 @@ fn test_metadata_survives_host_modification() {
     let host_path = temp_dir.path();
     let password = "metadata_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
     vfs.create_file("/test.txt", b"Test data")
         .expect("Failed to create file");
     vfs.sync().expect("Failed to sync");
@@ -152,10 +152,7 @@ fn test_metadata_survives_host_modification() {
 
     // Verify metadata file exists
     let metadata_path = host_path.join(".slack_meta.json");
-    assert!(
-        metadata_path.exists(),
-        "Metadata file should exist"
-    );
+    assert!(metadata_path.exists(), "Metadata file should exist");
 
     // Modify a host file (append data)
     let host_file = temp_dir.path().join("host_0.dat");
@@ -168,7 +165,10 @@ fn test_metadata_survives_host_modification() {
 
     // Try to mount - should still work (though some symbols may be lost)
     let result = SlackVfs::mount(host_path, password);
-    assert!(result.is_ok(), "Should still be able to mount after host modification");
+    assert!(
+        result.is_ok(),
+        "Should still be able to mount after host modification"
+    );
 }
 
 #[test]
@@ -177,8 +177,8 @@ fn test_health_detects_damage() {
     let host_path = temp_dir.path();
     let password = "health_detect_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
     vfs.create_file("/file1.txt", b"File one content")
         .expect("Failed to create file");
     vfs.create_file("/file2.txt", b"File two content")
@@ -227,8 +227,7 @@ fn test_high_redundancy_improves_resilience() {
         ..Default::default()
     };
 
-    let mut vfs =
-        SlackVfs::create(host_path, password, config).expect("Failed to create VFS");
+    let mut vfs = SlackVfs::create(host_path, password, config).expect("Failed to create VFS");
     vfs.create_file("/resilient.txt", b"This file should survive more damage")
         .expect("Failed to create file");
     vfs.sync().expect("Failed to sync");
@@ -257,8 +256,8 @@ fn test_superblock_survives_with_encryption() {
     let password = "superblock_test";
 
     // Create VFS with some content
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
     vfs.create_dir("/folder").expect("Failed to create dir");
     vfs.create_file("/folder/data.txt", b"Nested file")
         .expect("Failed to create file");
@@ -271,9 +270,15 @@ fn test_superblock_survives_with_encryption() {
             .expect(&format!("Failed to mount VFS on iteration {}", i));
 
         let entries = vfs.list_dir("/").expect("Failed to list root");
-        assert!(!entries.is_empty(), "Root should have entries on iteration {}", i);
+        assert!(
+            !entries.is_empty(),
+            "Root should have entries on iteration {}",
+            i
+        );
 
-        let content = vfs.read_file("/folder/data.txt").expect("Failed to read file");
+        let content = vfs
+            .read_file("/folder/data.txt")
+            .expect("Failed to read file");
         assert_eq!(content, b"Nested file".to_vec());
     }
 }
@@ -285,8 +290,8 @@ fn test_wipe_removes_all_data() {
     let password = "wipe_test";
 
     // Create VFS with content
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
     vfs.create_file("/secret.txt", b"Sensitive data")
         .expect("Failed to create file");
     vfs.sync().expect("Failed to sync");
@@ -305,4 +310,48 @@ fn test_wipe_removes_all_data() {
     // Cannot remount because VFS is wiped
     let result = SlackVfs::mount(host_path, password);
     assert!(result.is_err(), "Should not be able to mount wiped VFS");
+}
+
+#[test]
+fn test_superblock_replication() {
+    let temp_dir = setup_test_env(5, 4096);
+    let host_path = temp_dir.path();
+    let password = "replication_test";
+
+    // Create VFS
+    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default()).expect("Created");
+    vfs.sync().expect("Synced");
+    drop(vfs);
+
+    // Inspect metadata to verify replication count
+    let meta = slack_vfs::storage::SlackMetadata::load(host_path).expect("Loaded metadata");
+    let replica_count = meta.superblocks.len();
+    println!("Superblock replicas: {}", replica_count);
+
+    // We expect 3 replicas since we provided 5 hosts and they have enough space
+    assert_eq!(replica_count, 3, "Should have 3 replicas given 5 hosts");
+
+    // Corrupt the first replica
+    let first_loc = &meta.superblocks[0];
+    overwrite_slack_portion(&first_loc.host_path, first_loc.offset, 0, &[0u8; 100]);
+
+    // Try to mount - should succeed using 2nd or 3rd replica
+    let vfs = SlackVfs::mount(host_path, password).expect("Should mount with 1 corruption");
+    drop(vfs);
+
+    // Corrupt second replica
+    let second_loc = &meta.superblocks[1];
+    overwrite_slack_portion(&second_loc.host_path, second_loc.offset, 0, &[0u8; 100]);
+
+    // Try to mount - should succeed using 3rd replica
+    let vfs = SlackVfs::mount(host_path, password).expect("Should mount with 2 corruptions");
+    drop(vfs);
+
+    // Corrupt third replica (all corrupted)
+    let third_loc = &meta.superblocks[2];
+    overwrite_slack_portion(&third_loc.host_path, third_loc.offset, 0, &[0u8; 100]);
+
+    // Try to mount - should fail
+    let result = SlackVfs::mount(host_path, password);
+    assert!(result.is_err(), "Should fail when all replicas corrupted");
 }

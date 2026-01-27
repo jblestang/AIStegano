@@ -5,10 +5,10 @@
 
 mod operations;
 mod path;
-mod superblock;
+pub(crate) mod superblock;
 mod types;
 
 pub use operations::{HealthReport, SlackVfs};
 pub use path::VfsPath;
-pub use superblock::Superblock;
+pub use superblock::{HostAllocation, Superblock, SymbolAllocation};
 pub use types::{DirEntry, Inode, InodeId, InodeType};

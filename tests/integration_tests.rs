@@ -7,14 +7,14 @@ use tempfile::TempDir;
 
 /// Helper to create a test environment with host files.
 /// Note: file_size should NOT be a multiple of 4096 (block size) to ensure slack space exists.
-fn setup_test_env(num_files: usize, file_size: usize) -> TempDir {
+fn setup_test_env(num_files: usize, _file_size: usize) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
     for i in 0..num_files {
         let file_path = temp_dir.path().join(format!("host_{}.dat", i));
         // Use a size that is NOT aligned to block size to ensure slack space
-        // Add an offset to avoid exact block alignment
-        let actual_size = file_size + 100 + (i * 7); // Slightly different size per file
+        // Maximize slack: 100 bytes content -> ~3996 bytes slack
+        let actual_size = 100 + (i * 7);
         let data: Vec<u8> = (0..actual_size).map(|x| (x % 256) as u8).collect();
         fs::write(&file_path, &data).expect("Failed to create host file");
     }
@@ -29,8 +29,8 @@ fn test_full_workflow_create_write_read() {
     let password = "test_password_123";
 
     // Create VFS
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Write a file
     let content = b"Hello, World! This is a secret message.";
@@ -50,12 +50,12 @@ fn test_full_workflow_create_write_read() {
 
 #[test]
 fn test_multiple_files_and_directories() {
-    let temp_dir = setup_test_env(10, 8192);
+    let temp_dir = setup_test_env(30, 8192);
     let host_path = temp_dir.path();
     let password = "multi_file_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Create directory structure
     vfs.create_dir("/documents").expect("Failed to create dir");
@@ -84,7 +84,9 @@ fn test_multiple_files_and_directories() {
     assert_eq!(root_entries.len(), 3); // documents, images, readme.txt
 
     // List documents
-    let doc_entries = vfs.list_dir("/documents").expect("Failed to list documents");
+    let doc_entries = vfs
+        .list_dir("/documents")
+        .expect("Failed to list documents");
     assert_eq!(doc_entries.len(), 2); // work, report.txt
 
     // Verify file contents
@@ -104,12 +106,12 @@ fn test_multiple_files_and_directories() {
 
 #[test]
 fn test_file_deletion() {
-    let temp_dir = setup_test_env(5, 4096);
+    let temp_dir = setup_test_env(20, 4096);
     let host_path = temp_dir.path();
     let password = "delete_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Create and then delete files
     vfs.create_file("/temp1.txt", b"Temporary file 1")
@@ -134,7 +136,10 @@ fn test_file_deletion() {
     assert_eq!(entries[0].name, "keep.txt");
 
     // Verify kept file
-    assert_eq!(vfs.read_file("/keep.txt").unwrap(), b"Keep this file".to_vec());
+    assert_eq!(
+        vfs.read_file("/keep.txt").unwrap(),
+        b"Keep this file".to_vec()
+    );
 
     // Verify deleted files are gone
     assert!(vfs.read_file("/temp1.txt").is_err());
@@ -165,8 +170,8 @@ fn test_large_file() {
     let host_path = temp_dir.path();
     let password = "large_file_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Create a larger file (but still within capacity)
     let large_content: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
@@ -189,8 +194,8 @@ fn test_health_check_healthy() {
     let host_path = temp_dir.path();
     let password = "health_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
     vfs.create_file("/test.txt", b"Test content")
         .expect("Failed to create file");
     vfs.sync().expect("Failed to sync");
@@ -208,8 +213,8 @@ fn test_capacity_info() {
     let host_path = temp_dir.path();
     let password = "capacity_test";
 
-    let vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     let info = vfs.info();
     assert!(info.total_capacity > 0);
@@ -222,8 +227,8 @@ fn test_unicode_filenames() {
     let host_path = temp_dir.path();
     let password = "unicode_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Create files with unicode names
     vfs.create_file("/日本語.txt", b"Japanese content")
@@ -253,17 +258,20 @@ fn test_empty_file() {
     let host_path = temp_dir.path();
     let password = "empty_test";
 
-    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default())
-        .expect("Failed to create VFS");
+    let mut vfs =
+        SlackVfs::create(host_path, password, VfsConfig::default()).expect("Failed to create VFS");
 
     // Create an empty file
-    vfs.create_file("/empty.txt", b"").expect("Failed to create empty file");
+    vfs.create_file("/empty.txt", b"")
+        .expect("Failed to create empty file");
 
     vfs.sync().expect("Failed to sync");
     drop(vfs);
 
     // Mount and verify
     let vfs = SlackVfs::mount(host_path, password).expect("Failed to mount VFS");
-    let content = vfs.read_file("/empty.txt").expect("Failed to read empty file");
+    let content = vfs
+        .read_file("/empty.txt")
+        .expect("Failed to read empty file");
     assert!(content.is_empty());
 }

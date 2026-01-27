@@ -178,6 +178,16 @@ impl HostManager {
         self.hosts.len()
     }
 
+    /// Get a host file by path.
+    pub fn get_host(&self, path: &Path) -> Option<&HostFile> {
+        self.hosts.iter().find(|h| h.path == path)
+    }
+
+    /// Get a mutable host file by path.
+    pub fn get_host_mut(&mut self, path: &Path) -> Option<&mut HostFile> {
+        self.hosts.iter_mut().find(|h| h.path == path)
+    }
+
     /// Allocate space for symbols of given size.
     ///
     /// Returns locations for each symbol, distributed across hosts.
