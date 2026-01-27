@@ -678,9 +678,14 @@ impl SlackVfs {
             }
         }
 
-        // Clear metadata
+        // Delete the metadata file completely
+        let metadata_path = self.host_dir.join(".slack_meta.json");
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path)?;
+        }
+
+        // Clear in-memory metadata
         self.metadata.clear();
-        self.metadata.save(&self.host_dir)?;
 
         Ok(())
     }
