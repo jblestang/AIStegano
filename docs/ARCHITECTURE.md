@@ -121,20 +121,20 @@ impl HostManager {
 
 #### `metadata.rs` - Persistent Metadata
 
-Tracks where symbols are stored:
+Tracks where the encrypted superblock is stored:
 
 ```rust
 pub struct SlackMetadata {
+    pub version: u32,
     pub block_size: u64,
-    pub hosts: HashMap<PathBuf, HostMetadata>,
     pub salt: Option<[u8; 32]>,  // For key derivation
+    pub superblocks: Vec<SuperblockLocation>, // Locations of encrypted replicas
 }
 
-pub struct StoredSymbol {
-    pub symbol_id: u32,
+pub struct SuperblockLocation {
+    pub host_path: PathBuf,
     pub offset: u64,
-    pub length: u32,
-    pub vfs_file_id: u64,
+    pub length: u64,
 }
 ```
 
@@ -233,11 +233,14 @@ pub enum InodeType {
 pub struct Superblock {
     pub magic: [u8; 4],           // "SVFS"
     pub version: u32,
+    pub uuid: u128,              // Unique ID for this VFS
+    pub sequence_number: u64,     // Monotonic version counter
     pub block_size: u64,
     pub redundancy_ratio: f32,
     pub root_inode: InodeId,
     pub next_inode_id: InodeId,
     pub inodes: HashMap<InodeId, Inode>,
+    pub hosts: HashMap<PathBuf, HostAllocation>, // Host usage tracking
     pub salt: [u8; 32],
 }
 ```
@@ -414,22 +417,26 @@ Format: [nonce: 12 bytes][ciphertext: variable][tag: 16 bytes]
 
 ```json
 {
+  "version": 1,
   "block_size": 4096,
-  "hosts": {
-    "/path/to/host1.dat": {
-      "logical_size": 1234,
-      "symbols": [
-        {
-          "symbol_id": 0,
-          "offset": 0,
-          "length": 1024,
-          "vfs_file_id": 1
-        }
-      ]
+  "salt": [1, 2, 3, ...], // 32 bytes
+  "superblocks": [
+    {
+      "host_path": "/path/to/host1.dat",
+      "offset": 12345,
+      "length": 600
+    },
+    {
+      "host_path": "/path/to/host2.dat",
+      "offset": 9876,
+      "length": 600
+    },
+    {
+      "host_path": "/path/to/host3.dat",
+      "offset": 4567,
+      "length": 600
     }
-  },
-  "next_symbol_id": 10,
-  "salt": [1, 2, 3, ...] // 32 bytes
+  ]
 }
 ```
 

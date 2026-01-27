@@ -261,10 +261,12 @@ RaptorQ provides recovery from:
 
 ### ⚠️ Metadata is Visible
 
-The `.slack_meta.json` file is NOT encrypted:
-- Reveals that Slack VFS is in use
-- Shows host file paths
-- Contains salt (not secret, but identifying)
+The `.slack_meta.json` file is NOT encrypted, but now contains MINIMAL information:
+- **Salt** (for key derivation)
+- **Block Size**
+- **Pointers** to encrypted superblock replicas
+
+**Improvement**: Detailed host usage, symbol locations, and directory structure are now moved INSIDE the encrypted superblock. However, the presence of the VFS is still visible via this bootstrap file.
 
 **Mitigation**: Hide/encrypt the metadata file separately if needed.
 

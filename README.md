@@ -13,6 +13,7 @@ This tool hides encrypted data in that otherwise wasted space, making it invisib
 - **🔒 AES-256-GCM Encryption**: Military-grade authenticated encryption with Argon2id password-based key derivation
 - **📁 Virtual File System**: Full directory structure with standard file operations (create, read, delete, list)
 - **🔄 RaptorQ Erasure Coding**: Recover your data even when parts are overwritten or corrupted
+- **🛡️ Superblock Resilience**: 3-way replication and self-healing versioning for critical metadata
 - **🖥️ CLI Interface**: Easy-to-use command-line interface for all operations
 - **🔐 Password Protection**: Change passwords without re-encrypting all data
 - **✨ Steganographic**: Host files remain fully functional and unchanged
