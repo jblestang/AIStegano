@@ -121,20 +121,22 @@ impl HostManager {
 
 #### `metadata.rs` - Persistent Metadata
 
-Tracks where the encrypted superblock is stored:
+Tracks where the encrypted superblock symbols are stored. This bootstrap metadata is unencrypted but validated during recovery.
 
 ```rust
 pub struct SlackMetadata {
     pub version: u32,
     pub block_size: u64,
     pub salt: Option<[u8; 32]>,  // For key derivation
-    pub superblocks: Vec<SuperblockLocation>, // Locations of encrypted replicas
+    pub superblock_encoding: Option<EncodingInfo>, // RaptorQ params
+    pub superblock_symbols: Vec<SymbolLocation>,   // Symbol locations
 }
 
-pub struct SuperblockLocation {
+pub struct SymbolLocation {
     pub host_path: PathBuf,
-    pub offset: u64,
-    pub length: u64,
+    pub offset: u64, // Absolute offset in host file
+    pub symbol_id: u32,
+    pub length: u32,
 }
 ```
 
@@ -413,32 +415,55 @@ Format: [nonce: 12 bytes][ciphertext: variable][tag: 16 bytes]
 
 ## File Formats
 
-### `.slack_meta.json`
+### `.slack_meta.json` (Version 3)
 
 ```json
 {
-  "version": 1,
+  "version": 3,
   "block_size": 4096,
   "salt": [1, 2, 3, ...], // 32 bytes
-  "superblocks": [
+  "superblock_encoding": {
+    "original_length": 500,
+    "source_symbols": 1,
+    "repair_symbols": 1,
+    "symbol_size": 1024
+  },
+  "superblock_symbols": [
     {
       "host_path": "/path/to/host1.dat",
-      "offset": 12345,
-      "length": 600
+      "offset": 4096,
+      "length": 1024,
+      "symbol_id": 0
     },
     {
       "host_path": "/path/to/host2.dat",
-      "offset": 9876,
-      "length": 600
-    },
-    {
-      "host_path": "/path/to/host3.dat",
-      "offset": 4567,
-      "length": 600
+      "offset": 8192,
+      "length": 1024,
+      "symbol_id": 1
     }
   ]
 }
 ```
+
+> **Note:** `offset` in `superblock_symbols` is an ABSOLUTE offset from the beginning of the host file. This ensures reliable recovery even if the host file is modified or its size cannot be correctly inferred during discovery.
+
+### Encrypted Superblock Structure
+
+The superblock is processed in three stages:
+
+1.  **Serialization**: The `Superblock` struct is serialized using `bincode`.
+2.  **Encryption**: The serialized bytes are encrypted using AES-256-GCM.
+    *   Format: `[nonce: 12 bytes][ciphertext][tag: 16 bytes]`
+    *   Result length: `len(serialized) + 28 bytes`
+3.  **Erasure Coding**: The encrypted blob is encoded using RaptorQ into multiple symbols.
+    *   The encoding parameters (source count, symbol size) are stored in `.slack_meta.json`.
+
+Recovery Process:
+1.  Read `superblock_symbols` from `.slack_meta.json`.
+2.  Read symbol data from the specified host paths and offsets.
+3.  Reconstruct the encrypted blob using RaptorQ decoding.
+4.  Decrypt the blob using the key derived from the password and salt.
+5.  Deserialize to obtain the `Superblock` struct.
 
 ### Superblock (Encrypted)
 
