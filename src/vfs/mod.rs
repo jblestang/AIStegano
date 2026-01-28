@@ -6,7 +6,7 @@
 mod operations;
 mod path;
 pub(crate) mod superblock;
-mod types;
+pub mod types;
 
 pub use operations::{HealthReport, SlackVfs};
 pub use path::VfsPath;

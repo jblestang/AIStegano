@@ -10,5 +10,5 @@ pub(crate) mod metadata;
 mod slack;
 
 pub use host_manager::{HostFile, HostManager, SymbolLocation};
-pub use metadata::{SlackMetadata, SuperblockLocation};
+pub use metadata::SlackMetadata;
 pub use slack::{get_slack_capacity, read_slack, wipe_slack, write_slack};

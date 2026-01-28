@@ -11,23 +11,14 @@
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use crate::vfs::types::EncodingInfo;
+use crate::storage::host_manager::SymbolLocation;
 
 /// Metadata file name (hidden file).
 pub const METADATA_FILENAME: &str = ".slack_meta.json";
 
 /// Current metadata version.
-pub const METADATA_VERSION: u32 = 2;
-
-/// Location of the superblock in slack space.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuperblockLocation {
-    /// Host file containing the superblock.
-    pub host_path: PathBuf,
-    /// Absolute offset in the host file where superblock begins.
-    pub offset: u64,
-    /// Length of the encrypted superblock data.
-    pub length: u32,
-}
+pub const METADATA_VERSION: u32 = 3;
 
 /// Minimal bootstrap metadata - only contains data needed before decryption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,9 +30,13 @@ pub struct SlackMetadata {
     pub block_size: u64,
     /// Salt for key derivation (required for decryption).
     pub salt: Option<[u8; 32]>,
-    /// Locations of encrypted superblocks (replicas).
+    
+    /// Encoding parameters for the superblock (RaptorQ).
+    pub superblock_encoding: Option<EncodingInfo>,
+    
+    /// Locations of superblock symbols (distributed across hosts).
     #[serde(default)]
-    pub superblocks: Vec<SuperblockLocation>,
+    pub superblock_symbols: Vec<SymbolLocation>,
 }
 
 fn default_version() -> u32 {
@@ -54,7 +49,8 @@ impl Default for SlackMetadata {
             version: METADATA_VERSION,
             block_size: 4096,
             salt: None,
-            superblocks: Vec::new(),
+            superblock_encoding: None,
+            superblock_symbols: Vec::new(),
         }
     }
 }
@@ -66,7 +62,8 @@ impl SlackMetadata {
             version: METADATA_VERSION,
             block_size,
             salt: None,
-            superblocks: Vec::new(),
+            superblock_encoding: None,
+            superblock_symbols: Vec::new(),
         }
     }
 
@@ -105,13 +102,14 @@ impl SlackMetadata {
 
     /// Check if the VFS is initialized (has salt and at least one superblock).
     pub fn is_initialized(&self) -> bool {
-        self.salt.is_some() && !self.superblocks.is_empty()
+        self.salt.is_some() && !self.superblock_symbols.is_empty()
     }
 
     /// Clear the metadata (reset to empty state).
     pub fn clear(&mut self) {
         self.salt = None;
-        self.superblocks.clear();
+        self.superblock_encoding = None;
+        self.superblock_symbols.clear();
     }
 }
 
