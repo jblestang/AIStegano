@@ -355,3 +355,36 @@ fn test_superblock_replication() {
     let result = SlackVfs::mount(host_path, password);
     assert!(result.is_err(), "Should fail when all replicas corrupted");
 }
+
+#[test]
+fn test_superblock_discovery_after_rename() {
+    let temp_dir = setup_test_env(5, 4096);
+    let host_path = temp_dir.path();
+    let password = "discovery_test";
+
+    // 1. Create VFS and write data
+    let mut vfs = SlackVfs::create(host_path, password, VfsConfig::default()).expect("Created");
+    vfs.sync().expect("Synced");
+    drop(vfs);
+
+    // 2. Rename ALL host files
+    // host_0.dat -> host_0_moved.dat, etc.
+    let entries = std::fs::read_dir(host_path).unwrap();
+    for entry in entries {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().unwrap_or_default().to_string_lossy() == "dat" {
+            let new_name = format!("{}_moved.dat", path.file_stem().unwrap().to_string_lossy());
+            let new_path = host_path.join(new_name);
+            println!("Renaming {:?} to {:?}", path, new_path);
+            std::fs::rename(&path, &new_path).expect("Renamed");
+        }
+    }
+
+    // 3. Try to mount - should succeed via discovery
+    let vfs = SlackVfs::mount(host_path, password);
+    assert!(
+        vfs.is_ok(),
+        "Should mount even after renaming all host files"
+    );
+}

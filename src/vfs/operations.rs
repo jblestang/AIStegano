@@ -116,7 +116,7 @@ impl SlackVfs {
         let mut host_manager = HostManager::scan(host_dir, metadata.block_size)?;
 
         // Read and decrypt superblock
-        let superblock = Self::read_superblock(&metadata, password)?;
+        let superblock = Self::read_superblock(&metadata, Some(&host_manager), password)?;
 
         // Apply used slack from superblock
         for (path, host_alloc) in &superblock.hosts {
@@ -138,7 +138,11 @@ impl SlackVfs {
     }
 
     /// Read and decrypt the superblock from slack space.
-    fn read_superblock(metadata: &SlackMetadata, password: &str) -> Result<Superblock> {
+    fn read_superblock(
+        metadata: &SlackMetadata,
+        host_manager: Option<&HostManager>,
+        password: &str,
+    ) -> Result<Superblock> {
         // Get salt from metadata
         let salt = metadata
             .salt
@@ -202,9 +206,75 @@ impl SlackVfs {
             }
         }
 
+        if let Some(sb) = best_superblock {
+            return Ok(sb);
+        }
+
+        // FALLBACK: Discovery Mode
+        // If explicit locations failed (e.g. files renamed), try to find superblock
+        // by checking known offsets on ALL discovered hosts.
+        if let Some(hm) = host_manager {
+            // Collect unique offsets from metadata
+            let mut candidate_offsets = Vec::new();
+            for sb in &metadata.superblocks {
+                if !candidate_offsets.contains(&sb.offset) {
+                    candidate_offsets.push(sb.offset);
+                }
+            }
+
+            for host in hm.hosts() {
+                for &offset in &candidate_offsets {
+                    // Try to read length prefix
+                    // +4 for length prefix
+                    match read_slack(&host.path, offset, 4) {
+                        Ok(len_bytes) if len_bytes.len() == 4 => {
+                            let encrypted_len = u32::from_le_bytes([
+                                len_bytes[0],
+                                len_bytes[1],
+                                len_bytes[2],
+                                len_bytes[3],
+                            ]) as usize;
+
+                            // Sanity check length (max 1MB)
+                            if encrypted_len > 1024 * 1024 {
+                                continue;
+                            }
+
+                            // Read full blob
+                            match read_slack(&host.path, offset, 4 + encrypted_len) {
+                                Ok(data) => {
+                                    let encrypted_bytes = &data[4..];
+                                    match decrypt_with_key(encrypted_bytes, &key) {
+                                        Ok(plaintext) => {
+                                            if let Ok(sb) = Superblock::from_bytes(&plaintext) {
+                                                // Check if sequence number is better
+                                                match best_superblock {
+                                                    Some(ref current) => {
+                                                        if sb.sequence_number
+                                                            > current.sequence_number
+                                                        {
+                                                            best_superblock = Some(sb);
+                                                        }
+                                                    }
+                                                    None => best_superblock = Some(sb),
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {} // Decryption failed, likely not a superblock or wrong key
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         best_superblock.ok_or_else(|| {
             Error::DataCorruption(format!(
-                "Failed to read any valid superblock. Failures: {:?}",
+                "Failed to read any valid superblock. Failures: {:?}. Discovery also failed.",
                 failures
             ))
         })
