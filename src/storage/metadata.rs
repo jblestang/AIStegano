@@ -88,10 +88,18 @@ impl SlackMetadata {
     }
 
     /// Save metadata to a directory.
+    /// Save metadata to a directory securely (atomic update).
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = Self::file_path(dir);
+        let tmp_path = path.with_extension("tmp");
+        
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        
+        // Write to temp file first
+        std::fs::write(&tmp_path, content)?;
+        
+        // Atomically rename
+        std::fs::rename(tmp_path, path)?;
         Ok(())
     }
 

@@ -317,11 +317,10 @@ impl SlackVfs {
         self.superblock
             .remove_symbols_for_file(SUPERBLOCK_FILE_ID as InodeId);
 
-        // Sync host manager with updated superblock state (to reuse freed space)
-        for (path, host_alloc) in &self.superblock.hosts {
-            self.host_manager
-                .apply_used_slack(path, host_alloc.slack_used);
-        }
+        // NOTE: We do NOT sync host_manager yet.
+        // We want host_manager to still think the old superblock space is USED.
+        // This ensures allocate() finds new, non-overlapping space (Copy-on-Write).
+        // We will free the space in host_manager only after writing the new replicas.
 
         // 1. Initial Serialize to get baseline size
         let sb_bytes = self.superblock.to_bytes()?;
@@ -421,11 +420,16 @@ impl SlackVfs {
 
                 // Update metadata
                 self.metadata.superblocks.push(SuperblockLocation {
-                    host_path: path,
+                    host_path: path.clone(),
                     offset: host.logical_size + offset,
                     length: total_written_len,
                 });
             }
+        }
+
+        // Final sync of all hosts to ensure full consistency (frees space on hosts we didn't write to)
+        for (path, host_alloc) in &self.superblock.hosts {
+            self.host_manager.apply_used_slack(path, host_alloc.slack_used);
         }
 
         Ok(())
