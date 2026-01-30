@@ -13,6 +13,7 @@
 
 mod host_manager;
 pub(crate) mod metadata;
+pub(crate) mod metadata_discovery;
 mod slack;
 pub mod slack_backend;
 
@@ -25,6 +26,7 @@ pub mod macos;
 
 pub use host_manager::{HostFile, HostManager, SymbolLocation};
 pub use metadata::SlackMetadata;
+pub use metadata_discovery::MetadataDiscovery;
 pub use slack::{get_slack_capacity, read_slack, wipe_slack, write_slack};
 pub use slack_backend::{create_backend, SlackBackend, SlackRegion};
 

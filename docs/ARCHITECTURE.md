@@ -730,8 +730,8 @@ User Request: read_file("/documents/secret.txt")
 │  └────────────────────────────────────────────────────────────┘ │
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │ for each symbol_alloc in symbols:                          │ │
-│  │   • Get logical_size from superblock.hosts[host_path]     │ │
-│  │   • absolute_offset = logical_size + symbol_alloc.offset  │ │
+│  │   • Get logical_size from superblock.hosts[host_path]      │ │
+│  │   • absolute_offset = logical_size + symbol_alloc.offset   │ │
 │  │   • Open host file                                         │ │
 │  │   • Seek to absolute_offset                                │ │
 │  │   • Read symbol_alloc.length bytes                         │ │
