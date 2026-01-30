@@ -13,10 +13,11 @@ This tool hides encrypted data in that otherwise wasted space, making it invisib
 - **🔒 AES-256-GCM Encryption**: Military-grade authenticated encryption with Argon2id password-based key derivation
 - **📁 Virtual File System**: Full directory structure with standard file operations (create, read, delete, list)
 - **🔄 RaptorQ Erasure Coding**: Recover your data even when parts are overwritten or corrupted
-- **🛡️ Superblock Resilience**: 3-way replication and self-healing versioning for critical metadata
+- **🛡️ Superblock Resilience**: Erasure-coded symbols with self-healing versioning for critical metadata
 - **🖥️ CLI Interface**: Easy-to-use command-line interface for all operations
 - **🔐 Password Protection**: Change passwords without re-encrypting all data
 - **✨ Steganographic**: Host files remain fully functional and unchanged
+- **🐧 Multi-Platform**: Linux (ext4) and macOS (APFS/HFS+) support planned
 
 ## Architecture
 
@@ -224,6 +225,26 @@ If any 4 symbols are available, the original data can be recovered. This means:
 - 10% data loss → Full recovery ✓
 - 30% data loss → Full recovery ✓
 - 50%+ data loss → Recovery may fail ✗
+
+## Roadmap
+
+### Current (v0.1)
+- ✅ AES-256-GCM encryption with Argon2id KDF
+- ✅ RaptorQ erasure coding for resilience
+- ✅ Erasure-coded superblock with absolute offsets
+- ✅ Full VFS operations (create, read, delete, list)
+- ✅ Health check and capacity reporting
+
+### Planned (v0.2 - Block Device Access)
+- 🔄 **Linux ext4**: Raw block device access via `O_DIRECT` for true invisibility
+- 🔄 **macOS APFS**: `fcntl(F_LOG2PHYS_EXT)` for physical block mapping
+- 🔜 Dry-run mode for safe testing
+- 🔜 Automatic filesystem detection
+
+### Future
+- 📋 NTFS support for Windows
+- 📋 FUSE integration for transparent access
+- 📋 Hidden volume support (plausible deniability)
 
 ## License
 

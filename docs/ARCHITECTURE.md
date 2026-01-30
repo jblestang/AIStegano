@@ -76,9 +76,11 @@ The Slack VFS is a layered system that provides a virtual file system interface 
 
 ### Storage Layer (`src/storage/`)
 
-The storage layer provides low-level access to slack space.
+The storage layer provides low-level access to slack space with platform-specific implementations.
 
-#### `slack.rs` - Core Operations
+#### Current Implementation: File-Level I/O (`slack.rs`)
+
+The current implementation uses file-level APIs to write past the logical EOF:
 
 ```rust
 /// Calculate available slack space for a file
@@ -94,11 +96,55 @@ pub fn read_slack(path: &Path, logical_size: u64, len: usize) -> Result<Vec<u8>>
 pub fn wipe_slack(path: &Path, logical_size: u64, passes: Option<u8>) -> Result<()>;
 ```
 
-**How it works:**
+#### Future: Block Device Access (`src/storage/slack_backend.rs`)
 
-1. Get file's allocated size (blocks × block_size)
-2. Calculate slack = allocated_size - logical_size
-3. Seek to logical_EOF and read/write
+For true steganographic storage (invisible to `stat`/`ls`), raw block device access is being implemented:
+
+```rust
+/// Common trait for platform-specific slack access
+pub trait SlackBackend: Send + Sync {
+    fn get_slack_regions(&self, path: &Path) -> Result<Vec<SlackRegion>>;
+    fn read_slack(&self, region: &SlackRegion, offset: u64, len: usize) -> Result<Vec<u8>>;
+    fn write_slack(&self, region: &SlackRegion, offset: u64, data: &[u8]) -> Result<()>;
+}
+
+pub struct SlackRegion {
+    pub host_path: PathBuf,
+    pub block_device: PathBuf,      // /dev/sdX or /dev/rdiskN
+    pub physical_block: u64,        // Block number on device
+    pub offset_in_block: u64,       // Where slack starts
+    pub slack_size: u64,            // Available bytes
+}
+```
+
+##### Linux Implementation (`src/storage/linux/`)
+
+- **`ext4.rs`**: Parses ext4 superblock, group descriptors, inode tables, and extent trees
+- **`block_device.rs`**: O_DIRECT raw block I/O with proper alignment
+
+```rust
+// Linux: Parse ext4 to find physical block location
+pub fn get_physical_block(fd: RawFd, logical_block: u64) -> Result<u64>;
+
+// Read/write with O_DIRECT for true invisibility
+pub fn read_block_direct(device: &Path, block_num: u64, block_size: u64) -> Result<Vec<u8>>;
+pub fn write_block_direct(device: &Path, block_num: u64, data: &[u8]) -> Result<()>;
+```
+
+##### macOS Implementation (`src/storage/macos/`)
+
+- **`apfs.rs`**: Uses `fcntl(F_LOG2PHYS_EXT)` to map file offsets to physical disk locations
+- **`raw_disk.rs`**: Raw access to `/dev/rdiskN` character devices
+
+```rust
+// macOS: Get physical block via fcntl
+pub fn get_physical_offset(file: &File, logical_offset: u64) -> Result<PhysicalMapping>;
+
+// Access raw disk
+pub fn open_raw_disk(path: &Path) -> Result<RawDiskHandle>;
+```
+
+> **Note:** Block device access requires root privileges (`sudo` or `CAP_SYS_RAWIO` on Linux).
 
 #### `host_manager.rs` - Host File Management
 
