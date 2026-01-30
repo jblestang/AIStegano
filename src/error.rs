@@ -88,6 +88,14 @@ pub enum Error {
     /// Version mismatch.
     #[error("VFS version mismatch: expected {expected}, found {found}")]
     VersionMismatch { expected: u32, found: u32 },
+
+    /// Permission denied (typically for raw block device access).
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// Unsupported operation or platform.
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl From<serde_json::Error> for Error {

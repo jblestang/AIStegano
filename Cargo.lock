@@ -562,6 +562,7 @@ dependencies = [
  "bincode",
  "clap",
  "hex",
+ "libc",
  "rand",
  "raptorq",
  "rpassword",
