@@ -237,16 +237,16 @@ impl SlackVfs {
             host.slack_used = 0;
         }
         for sym in &self.superblock.symbols {
+             // Get the correct logical_size from host_manager
+             let logical_size = self.host_manager.get_host(&sym.host_path)
+                 .map(|h| h.logical_size)
+                 .unwrap_or(0);
+             
              let host = self.superblock.hosts.entry(sym.host_path.clone())
-                 .or_insert(crate::vfs::superblock::HostAllocation { logical_size: 0, slack_used: 0 }); // logical_size fixup needed? 
-                 // We don't have easy logical size access here without host manager.
-                 // But we just cleared it. existing entries have logical_size preserved? 
-                 // Wait. `values_mut` iterator. `host` is reference.
-                 // `host.slack_used = 0`. `host.logical_size` is untouched.
-                 // If `or_insert` creates new, `logical_size` is 0. 
-                 // But symbols only exist on hosts that are already tracked? 
-                 // If not, we have bigger issues.
-             host.slack_used += sym.length as u64;
+                 .or_insert(crate::vfs::superblock::HostAllocation { logical_size, slack_used: 0 });
+             // Use high-water mark: next free offset is max(current_used, offset + length)
+             // This correctly handles non-contiguous allocations
+             host.slack_used = host.slack_used.max(sym.offset + sym.length as u64);
         }
 
         // Serialize

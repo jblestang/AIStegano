@@ -4,8 +4,6 @@
 
 use crate::error::{Error, Result};
 use crate::storage::slack_backend::SlackRegion;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// APFS block mapper using fcntl.

@@ -3,7 +3,7 @@
 mod apfs;
 mod raw_disk;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::storage::slack_backend::{SlackBackend, SlackRegion};
 use std::path::Path;
 
