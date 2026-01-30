@@ -546,3 +546,318 @@ Host File Layout:
         │                              │
         └──────── Slack Space ─────────┘
 ```
+
+## Data Arborescence in Slack Space
+
+### Overview
+
+The VFS creates a distributed tree structure across multiple host files' slack space. Unlike traditional filesystems where data is stored contiguously, the Slack VFS fragments and distributes data using erasure coding, making it resilient to partial data loss.
+
+### Three-Level Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Level 1: Metadata File                        │
+│                   (.slack_meta.json)                             │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ • Salt for key derivation                                  │ │
+│  │ • Superblock symbol locations (absolute offsets)           │ │
+│  │ • Encoding parameters (source/repair symbol counts)        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Level 2: Superblock                           │
+│              (Encrypted, Erasure-Coded Symbols)                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ • VFS metadata (UUID, version, sequence number)            │ │
+│  │ • Inode table (files and directories)                      │ │
+│  │ • Symbol allocation map (file_id → symbol locations)       │ │
+│  │ • Host allocation tracking (logical_size, slack_used)      │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Level 3: File Data                            │
+│              (Encrypted, Erasure-Coded Symbols)                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ File 1: [Symbol 0] [Symbol 1] [Symbol 2] ...              │ │
+│  │ File 2: [Symbol 3] [Symbol 4] [Symbol 5] ...              │ │
+│  │ File N: [Symbol X] [Symbol Y] [Symbol Z] ...              │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Physical Distribution Across Host Files
+
+```
+Host File A (host_0.dat)          Host File B (host_1.dat)
+┌──────────────────────┐          ┌──────────────────────┐
+│ Original Content     │          │ Original Content     │
+│ (100 bytes)          │          │ (250 bytes)          │
+├──────────────────────┤          ├──────────────────────┤
+│ SB Symbol 0 (1024)   │          │ File1 Sym 1 (1024)   │
+│ File1 Sym 0 (1024)   │          │ File2 Sym 0 (1024)   │
+│ File1 Sym 2 (1024)   │          │ File2 Sym 2 (1024)   │
+└──────────────────────┘          └──────────────────────┘
+
+Host File C (host_2.dat)          Host File D (host_3.dat)
+┌──────────────────────┐          ┌──────────────────────┐
+│ Original Content     │          │ Original Content     │
+│ (500 bytes)          │          │ (75 bytes)           │
+├──────────────────────┤          ├──────────────────────┤
+│ SB Symbol 1 (1024)   │          │ SB Symbol 2 (1024)   │
+│ File1 Sym 3 (1024)   │          │ File2 Sym 1 (1024)   │
+│ File2 Sym 3 (1024)   │          │ File2 Sym 4 (1024)   │
+└──────────────────────┘          └──────────────────────┘
+
+Legend:
+  SB = Superblock symbol
+  File1 Sym N = Symbol N of File 1
+  File2 Sym N = Symbol N of File 2
+```
+
+### Symbol Allocation Strategy
+
+The `HostManager` allocates symbols using a **high-water mark** strategy:
+
+```rust
+// For each host file, track:
+pub struct HostFile {
+    pub logical_size: u64,    // Original file size
+    pub slack_capacity: u64,  // Total slack available
+    pub used_slack: u64,      // High-water mark (max offset + length)
+}
+
+// Allocation algorithm:
+fn allocate(&mut self, size: u64) -> Option<u64> {
+    if self.used_slack + size <= self.slack_capacity {
+        let offset = self.used_slack;  // Relative to slack start
+        self.used_slack += size;       // Increment high-water mark
+        Some(offset)
+    } else {
+        None  // Not enough space
+    }
+}
+```
+
+**Critical Detail:** The `used_slack` is computed as `max(offset + length)` across all symbols on that host, not as a sum of lengths. This prevents data overwrites when symbols are allocated non-contiguously.
+
+### Superblock Symbol Tracking
+
+The superblock maintains a complete map of all file symbols:
+
+```rust
+pub struct Superblock {
+    // ... other fields ...
+    pub symbols: Vec<SymbolAllocation>,
+    pub hosts: HashMap<PathBuf, HostAllocation>,
+}
+
+pub struct SymbolAllocation {
+    pub symbol_id: u32,
+    pub file_id: InodeId,        // Which VFS file owns this symbol
+    pub host_path: PathBuf,      // Which host file contains it
+    pub offset: u64,             // Offset from slack start (relative)
+    pub length: u32,             // Symbol size in bytes
+}
+
+pub struct HostAllocation {
+    pub logical_size: u64,       // Original file size
+    pub slack_used: u64,         // High-water mark for allocations
+}
+```
+
+## File Reconstruction Algorithm
+
+### Complete Read Path
+
+```
+User Request: read_file("/documents/secret.txt")
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: Load Metadata (.slack_meta.json)                        │
+│  • Read salt for key derivation                                 │
+│  • Get superblock symbol locations (absolute offsets)           │
+│  • Get encoding parameters                                      │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 2: Reconstruct Superblock                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ for each superblock_symbol in metadata:                    │ │
+│  │   • Open host file at symbol.host_path                     │ │
+│  │   • Seek to symbol.offset (absolute)                       │ │
+│  │   • Read symbol.length bytes                               │ │
+│  │   • Store as EncodingSymbol(id, data)                      │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ RaptorQ Decode:                                            │ │
+│  │   • Input: collected symbols                               │ │
+│  │   • Output: encrypted superblock blob                      │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Decrypt:                                                   │ │
+│  │   • Derive key from password + salt                        │ │
+│  │   • AES-256-GCM decrypt                                    │ │
+│  │   • Verify authentication tag                              │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Deserialize:                                               │ │
+│  │   • bincode::deserialize → Superblock struct               │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 3: Resolve Path to Inode                                   │
+│  • Parse path: "/documents/secret.txt"                          │
+│  • Start at root inode (ID 0)                                   │
+│  • Traverse: root → "documents" → "secret.txt"                  │
+│  • Result: inode_id = 5, encoding_info = {...}                  │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 4: Collect File Symbols                                    │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ symbols = superblock.get_symbols_for_file(inode_id)        │ │
+│  │ // Returns all SymbolAllocations where file_id == 5        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ for each symbol_alloc in symbols:                          │ │
+│  │   • Get logical_size from superblock.hosts[host_path]     │ │
+│  │   • absolute_offset = logical_size + symbol_alloc.offset  │ │
+│  │   • Open host file                                         │ │
+│  │   • Seek to absolute_offset                                │ │
+│  │   • Read symbol_alloc.length bytes                         │ │
+│  │   • Store as EncodingSymbol(symbol_id, data)               │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 5: Decode File Data                                        │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ RaptorQ Decode:                                            │ │
+│  │   • Input: collected symbols (may be incomplete)           │ │
+│  │   • Required: source_symbols count                         │ │
+│  │   • Available: source + repair symbols                     │ │
+│  │   • If available >= source: SUCCESS                        │ │
+│  │   • Output: encrypted file blob                            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 6: Decrypt File Data                                       │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Deserialize:                                               │ │
+│  │   • bincode::deserialize → EncryptedData struct            │ │
+│  │   • Extract: salt (32 bytes), ciphertext (variable)        │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Decrypt:                                                   │ │
+│  │   • Derive key from password + salt                        │ │
+│  │   • AES-256-GCM decrypt ciphertext                         │ │
+│  │   • Verify authentication tag                              │ │
+│  │   • Output: plaintext file data                            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+              Return plaintext
+```
+
+### Detailed Example: Reading a 3KB File
+
+```
+File: /photos/vacation.jpg (3000 bytes plaintext)
+
+1. Encryption:
+   3000 bytes → AES-256-GCM → 3028 bytes (+ nonce + tag)
+   → bincode serialize EncryptedData → 3070 bytes
+
+2. Erasure Coding (50% redundancy):
+   3070 bytes ÷ 1024 bytes/symbol = 3 source symbols (3072 bytes)
+   Repair symbols = 3 × 0.5 = 2 (rounded up)
+   Total: 5 symbols × 1024 bytes = 5120 bytes
+
+3. Symbol Distribution:
+   Symbol 0 (id=10) → host_0.dat, offset=2048
+   Symbol 1 (id=11) → host_1.dat, offset=0
+   Symbol 2 (id=12) → host_0.dat, offset=3072
+   Symbol 3 (id=13) → host_2.dat, offset=1024  (repair)
+   Symbol 4 (id=14) → host_1.dat, offset=1024  (repair)
+
+4. Superblock Entry:
+   Inode {
+     id: 7,
+     name: "vacation.jpg",
+     size: 3000,
+     encoding_info: {
+       original_length: 3070,
+       source_symbols: 3,
+       repair_symbols: 2,
+       symbol_size: 1024
+     }
+   }
+   
+   SymbolAllocations:
+   [
+     { symbol_id: 10, file_id: 7, host: "host_0.dat", offset: 2048, length: 1024 },
+     { symbol_id: 11, file_id: 7, host: "host_1.dat", offset: 0,    length: 1024 },
+     { symbol_id: 12, file_id: 7, host: "host_0.dat", offset: 3072, length: 1024 },
+     { symbol_id: 13, file_id: 7, host: "host_2.dat", offset: 1024, length: 1024 },
+     { symbol_id: 14, file_id: 7, host: "host_1.dat", offset: 1024, length: 1024 }
+   ]
+
+5. Reconstruction (assuming Symbol 2 is corrupted):
+   Available: Symbols 0, 1, 3, 4 (4 symbols)
+   Required: 3 source symbols
+   Status: ✓ Can decode (4 >= 3)
+   
+   RaptorQ Decode: [Sym 0, Sym 1, Sym 3, Sym 4] → 3070 bytes
+   Deserialize: 3070 bytes → EncryptedData { salt, ciphertext }
+   Decrypt: ciphertext → 3000 bytes plaintext
+   Result: vacation.jpg recovered successfully!
+```
+
+### Resilience Characteristics
+
+| Scenario | Symbols Lost | Recovery Status |
+|----------|--------------|-----------------|
+| No damage | 0/5 | ✓ Full recovery |
+| Minor corruption | 1/5 (20%) | ✓ Full recovery |
+| Moderate damage | 2/5 (40%) | ✓ Full recovery |
+| Severe damage | 3/5 (60%) | ✗ Cannot decode |
+
+The system can tolerate up to `repair_symbols` worth of data loss. With 50% redundancy (2 repair symbols for 3 source symbols), any 3 out of 5 symbols are sufficient for full recovery.
+
+### Offset Calculation Details
+
+**Critical:** Offsets are stored as **relative to slack start**, but reads use **absolute file offsets**:
+
+```rust
+// During write:
+let slack_offset = host.allocate(symbol_size);  // e.g., 2048 (relative)
+let absolute_offset = host.logical_size + slack_offset;  // e.g., 100 + 2048 = 2148
+write_slack(&host.path, &symbol.data, absolute_offset);
+
+// Stored in superblock:
+SymbolAllocation {
+    offset: slack_offset,  // 2048 (relative)
+    // ...
+}
+
+// During read:
+let logical_size = superblock.get_logical_size(&alloc.host_path);  // 100
+let absolute_offset = logical_size + alloc.offset;  // 100 + 2048 = 2148
+let data = read_slack(&alloc.host_path, absolute_offset, alloc.length);
+```
+
+This design ensures that even if the host file's logical size changes slightly, the system can still attempt recovery by using the stored `logical_size` from the superblock's `HostAllocation` map.
